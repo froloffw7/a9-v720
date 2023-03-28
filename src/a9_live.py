@@ -154,12 +154,12 @@ def show_live(cam: v720_ap):
                 if (fd2 >= 0): # and (count > 10):
                     # writer_lock.acquire()
                     #print("Write Audio...", end='')
-                    os.write(fd2, data)
+                    os.write(fd2, data)  # Write audio frame to fd_pipe
                     #print("Done")
                     # writer_lock.release()
                     frame_cnt_aud = frame_cnt_aud + 1
                     if frame_cnt_aud > frame_cnt_vid + 2:
-                        os.write(fd1, last_frame)  # Write audio frame to fd_pipe
+                        os.write(fd1, last_frame)  # Write last video frame to fd_pipe again
                         frame_cnt_vid = frame_cnt_vid + 1
                         frames_repeat = frames_repeat + 1
             
@@ -180,7 +180,7 @@ def show_live(cam: v720_ap):
         os.unlink(pipe1)
         os.unlink(pipe2)
 
-        print("\nFrames received: video=%d(lost=%4.1f%%) audio=%d" % (frame_cnt_vid, frames_repeat*100/frame_cnt_vid, frame_cnt_aud))
+        print("\nFrames received: video=%d(missed=%4.1f%%) audio=%d" % (frame_cnt_vid, frames_repeat*100/frame_cnt_vid, frame_cnt_aud))
 
         return
 
