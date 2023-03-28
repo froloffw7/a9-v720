@@ -55,6 +55,10 @@ def show_live(cam: v720_ap):
                                 "-i", pipe1,
                                 "-f", "alaw", "-ar", "8k", "-ac", "1", "-analyzeduration", "1000",
                                 "-i", pipe2,
+                                "-vf", "drawtext=x=18:y=18"
+                                ":fontfile=arialbd.ttf:fontsize=36:fontcolor=white"
+                                ":text='%{localtime\:%H\\\\\:%M\\\\\:%S}'",
+                                "-aspect", "640:480",
                                 "-y", "output.mp4"],
                                 #stdin=subprocess.PIPE)
                                 stdin=None)
