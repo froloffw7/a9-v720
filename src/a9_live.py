@@ -1,106 +1,192 @@
 #!/usr/bin/env python3
 
-import cv2
-import numpy
 import io
 import cmd_udp
 import time
 from datetime import datetime
+import subprocess
+import os
 from threading import Timer, Lock
-from PIL import Image
 
 from netcl_tcp import netcl_tcp
 from v720_ap import v720_ap
+from config import *
 
-HOST = "192.168.169.1"
-PORT = 6123
-WAV_HDR = b'RIFF\x8a\xdc\x01\x00WAVEfmt \x12\x00\x00\x00\x06\x00\x01\x00@\x1f\x00\x00@\x1f\x00\x00\x01\x00\x08\x00\x00\x00fact\x04\x00\x00\x006\xdc\x01\x00LIST\x1a\x00\x00\x00INFOISFT\x0e\x00\x00\x00Lavf58.45.100\x00data6\xdc\x01\x00'
+import sys
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
 
 frame_time = time.time()
 last_img = None
 writer_lock = Lock()
 
-def cv2_show_img(frame: bytearray):
-    global frame_time, last_img, writer_lock
-    t = time.time()
-    fps = round(1 / (t - frame_time), 2)
-    
-    writer_lock.acquire()
-    last_img = numpy.array(Image.open(io.BytesIO(frame)))
-    cv2.putText(last_img, str(datetime.now()), (5, 15),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 255, 0), 1, cv2.LINE_AA)
-    cv2.putText(last_img, f'FPS: {fps}', (5, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 255, 0), 1, cv2.LINE_AA)
-    writer_lock.release()
-    cv2.imshow('Frame', last_img)
 
-    frame_time = t
+def show_live(cam: v720_ap):
 
-
-def show_live(cam: v720_ap, videofile: str = None, audiofile: str = None):
-    cv2.startWindowThread()
-    cv2.namedWindow('Frame')
+    frame_cnt_vid = 0
+    frame_cnt_aud = 0
+    frames_repeat = 0
+    last_frame = bytearray()
 
     print('Press CTRL-C to exit')
-    _video = None
-    if videofile is not None:
-        _video = cv2.VideoWriter(videofile, cv2.VideoWriter_fourcc(
-            'M', 'J', 'P', 'G'), 10, (640, 480))
 
-        def _save_video():
-            global writer_lock, last_img
-            writer_lock.acquire()
-            if last_img is not None:
-                _video.write(last_img)
-            writer_lock.release()
-            
-            _v_writer_tmr = Timer(0.1, _save_video)
-            _v_writer_tmr.setDaemon(True)
-            _v_writer_tmr.start()
+    # Names of the "Named pipes"
+    pipe1 = "/tmp/pipe_video"
+    pipe2 = "/tmp/pipe_audio"
 
-        _save_video()
+    # Create "named pipes".
+    ### if not stat.S_ISFIFO(os.stat(pipe1).st_mode):
+    if not os.path.exists(pipe1):
+        os.mkfifo(pipe1)  # Create the pipe only if not exist.
 
-    _audio = None
-    if audiofile is not None:
-        _audio = open(audiofile, 'wt')
-        _audio.write(WAV_HDR)
+    ### if not stat.S_ISFIFO(os.stat(pipe2).st_mode):
+    if not os.path.exists(pipe2):
+        os.mkfifo(pipe2)
+
+    # Open FFmpeg as sub-process
+    # Use two input streams:
+    # 1. Named pipe: "pipe_video"
+    # 2. Named pipe: "pipe_audio"
+    # Merge the two streams.
+    # Store the result to output file: output.mp4
+    process = subprocess.Popen(["ffmpeg", '-loglevel', 'error',  #'debug'
+                                "-f", "mjpeg", "-r", "10",
+                                "-i", pipe1,
+                                "-f", "alaw", "-ar", "8k", "-ac", "1", "-analyzeduration", "1000",
+                                "-i", pipe2,
+                                "-y", "output.mp4"],
+                                #stdin=subprocess.PIPE)
+                                stdin=None)
+
+    fd1 = os.open(pipe1, os.O_WRONLY)  # fd1 is a file descriptor (an integer)
+    # we have to delay audio pipe open because ffmpeg will open it after analizing video stream
+    #fd2 = os.open(pipe2, os.O_WRONLY)  # fd2 is a file descriptor (an integer)
+    fd2 = -1
 
     try:
         sync = False
         frame = bytearray()
+        start_time = datetime.now()
+        count = 0
 
         def on_rcv(cmd, data: bytearray):
+            nonlocal fd1, fd2
             nonlocal sync
+            nonlocal count
+
+            nonlocal frame_cnt_vid, frame_cnt_aud
+            nonlocal frames_repeat
+            
+            global writer_lock
+
+            data_len = len(data)
+            if data_len == 0:
+                print('\nNo data')
+                return
+            
+            if data_len > 32:
+                hex_len = 32
+            else:
+                hex_len = data_len
+            
+            eprint(f'on_rcv({cmd},{data_len}): {data[:hex_len].hex()} ... {data[data_len-8:data_len].hex()}')
             if cmd == cmd_udp.P2P_UDP_CMD_JPEG:
+                ### eprint(f'{sync},{len(frame)}')
                 if not sync:
-                    f = data.find(b'\xff\xd8')
-                    if f != -1:
-                        frame.extend(data[f:])
+                    if data_len < 2:
+                        print('\ndata chunk too small')
+                        return
+                    # JPEG start marker
+                    if (data[0] == 0xff) and (data[1] == 0xd8):
                         sync = True
-                else:  # sync == true
-                    f = data.find(b'\xff\xd9')
-                    if f != -1:
-                        frame.extend(data[:f+2])
-                        cv2_show_img(frame)
-                        frame.clear()
-                        sync = False
                     else:
-                        frame.extend(data)
-            elif cmd == cmd_udp.P2P_UDP_CMD_G711 and _audio is not None:
-                _audio.write(data)
+                        return
+
+                # Sanity
+                if len(frame) > 0x400000: # 4MB
+                    print(f'\njpeg frame too long: {len(frame)}')
+                    frame.clear()
+                    sync = False
+                    return
+
+                ### Do we need this lock?
+                ### writer_lock.acquire()
+                
+                frame.extend(data)
+
+                tot = len(frame) - 5
+                ### eprint(f'tot={tot} len={len(frame)}  {frame[tot-2]} {frame[tot-1]}')
+                # JPEG end marker
+                if (tot > 2) and (frame[tot-2] == 0xff) and (frame[tot-1] == 0xd9):
+                    jpeg_len = frame[tot+1] + (frame[tot+2] << 8) + (frame[tot+3] << 16) + (frame[tot+4] << 24)
+                    if jpeg_len != tot:
+                        print(f'\njpeg_len={jpeg_len} total={tot}')
+
+                    ### Using chunks is not required
+                    """
+                    chunk_size = 1024
+                    for i in range(0, tot, chunk_size):
+                        print(i)
+                        # Write to named pipe as writing to a file (but write the data in small chunks).
+                        if chunk_size+i > tot:
+                            os.write(fd1, frame[i:tot])  # Write last bytes of data to fd_pipe
+                        else:
+                            os.write(fd1, frame[i:chunk_size+i])  # Write 1024 bytes of data to fd_pipe
+                    """
+                    ### print("Write Video ...", end='')
+                    os.write(fd1, frame)  # Write video frame to fd_pipe
+                    count = count + 1
+                    ### print("Done")
+                    frame_cnt_vid = frame_cnt_vid + 1
+
+                    last_frame[:] = frame
+
+                    frame.clear()
+                    sync = False
+
+                    if (fd2 < 0) and (count == 2):
+                        fd2 = os.open(pipe2, os.O_WRONLY)  # fd2 is a file descriptor (an integer)
+                
+                ### writer_lock.release()
+
+            elif cmd == cmd_udp.P2P_UDP_CMD_G711:
+                if (fd2 >= 0): # and (count > 10):
+                    # writer_lock.acquire()
+                    #print("Write Audio...", end='')
+                    os.write(fd2, data)
+                    #print("Done")
+                    # writer_lock.release()
+                    frame_cnt_aud = frame_cnt_aud + 1
+                    if frame_cnt_aud > frame_cnt_vid + 2:
+                        os.write(fd1, last_frame)  # Write audio frame to fd_pipe
+                        frame_cnt_vid = frame_cnt_vid + 1
+                        frames_repeat = frames_repeat + 1
+            
+                    elapsed = datetime.now() - start_time
+                    print(f"{elapsed}" " (%4.1f%%)" % (frames_repeat*100/frame_cnt_vid), end = '\r')
+        
         cam.cap_live(on_rcv)
 
     except KeyboardInterrupt:
-        if _video is not None:
-            _video.release()
-        if _audio is not None:
-            _audio.flush()
-            _audio.close()
+
+        # Closing the pipes as closing files.
+        os.close(fd1)
+        os.close(fd2)
+
+        process.wait()  # Wait for FFmpeg sub-process to finish
+
+        # Remove the "named pipes".
+        os.unlink(pipe1)
+        os.unlink(pipe2)
+
+        print("\nFrames received: video=%d(lost=%4.1f%%) audio=%d" % (frame_cnt_vid, frames_repeat*100/frame_cnt_vid, frame_cnt_aud))
+
         return
 
 
 if __name__ == '__main__':
-    with netcl_tcp(HOST, PORT) as sock:
+    with netcl_tcp(AP_HOST, PORT) as sock:
         cam = v720_ap(sock)
         cam.init_live_motion()
-        show_live(cam, 'live.avi')
+        show_live(cam)
